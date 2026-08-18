@@ -238,22 +238,55 @@ POST  /api/reveal/{job_id}     open the containing folder
 GET   /api/log/{job_id}        the job's ffmpeg log
 ```
 
-## Remote access — read before exposing this
+## Docker
 
-SpeedLab is built as a **local, single-user tool** and binds `127.0.0.1` on purpose. It has
-no authentication of any kind. Do not put it behind a public URL as-is:
+The image ships Debian's ffmpeg, which **is** built with rubberband — so the container gets
+the preferred audio engine with no source build. This is the easiest way to get a correct
+environment on any machine.
 
-- anyone with the link could upload files, burn your CPU and fill your disk
-- `GET /api/output/{id}` and `/api/log/{id}` would hand out your finished videos and logs
-- `POST /api/reveal/{id}` runs `open` / `explorer` **on the host machine**
+```
+docker compose up -d --build
+```
 
-Before it could safely take a public address it needs, at minimum: an auth layer, upload size
-and rate limits, `/api/reveal` disabled for non-local requests, and a host with an
-ffmpeg build that has rubberband. A box able to chew through 4K vertical video is also not a
-free tier.
+Serves on `http://127.0.0.1:5070`. All state (db, inbox, work, outbox, logs, manifests) lives
+in `./data` on the host through a bind mount, so it survives rebuilds and your finished files
+land in `data/outbox/`.
 
-For using it on a second machine, clone the repo and run it locally there — same tool, no
-exposure.
+## Remote access
+
+SpeedLab defaults to a local, single-user tool and binds `127.0.0.1`. Three things must be
+true before it is reachable from anywhere else, and all three are implemented:
+
+**1. Authentication.** Set `SPEEDLAB_AUTH_TOKEN` and every request — pages, API and static
+assets alike — needs it. HTTP Basic (any username, the token as password) or
+`Authorization: Bearer <token>`. Comparison is constant-time. Unset, the app stays open for
+frictionless local use.
+
+**2. Host commands refuse remote callers.** `POST /api/reveal/{id}` runs `open` / `explorer`
+on the machine hosting SpeedLab. It is rejected with `403` for any non-loopback client, so a
+remote user can never drive the host's shell.
+
+**3. Upload limits.** `SPEEDLAB_MAX_UPLOAD_MB` (default 4096) is enforced while streaming to
+disk, so an oversized POST is aborted mid-write and the partial file removed rather than
+filling the disk. `SPEEDLAB_MAX_FILES` (default 50) caps files per request.
+
+### Exposing it
+
+Put the token in `.env` (gitignored), bring the container up, then tunnel:
+
+```
+docker compose up -d
+cloudflared tunnel --url http://127.0.0.1:5070
+```
+
+That prints a `https://<random>.trycloudflare.com` URL. Two caveats: the tunnel is
+**ephemeral** — it dies with the process and the URL changes each time — and it only works
+while your machine is awake and the container is running. For a stable address you need a
+Cloudflare account and a named tunnel against a domain you own.
+
+Even with all of the above, remember what this is: a URL that lets whoever holds the password
+run video encodes on your machine. Rotate the token by editing `.env` and running
+`docker compose up -d` again.
 
 ## Troubleshooting
 

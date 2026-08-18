@@ -1,7 +1,9 @@
 """UPSURGE SpeedLab - FastAPI routes. Local, single user, no auth."""
+import base64
 import json
 import os
 import platform
+import secrets
 import shutil
 import subprocess
 import uuid
@@ -9,7 +11,7 @@ from contextlib import asynccontextmanager
 from typing import List
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import db, ffmpeg_ops, probe, worker
@@ -22,6 +24,14 @@ ALLOWED_EXT = {".mp4", ".mov", ".mkv", ".webm"}
 DEFAULT_SPEED = 1.25
 DEFAULT_PROFILE = "voice_music"
 
+# --- exposure controls ------------------------------------------------------
+# Unset by default: a local-only run stays frictionless. Set it and every request
+# must authenticate, which is what makes reaching this over a public URL sane.
+AUTH_TOKEN = os.environ.get("SPEEDLAB_AUTH_TOKEN", "").strip()
+MAX_UPLOAD_BYTES = int(os.environ.get("SPEEDLAB_MAX_UPLOAD_MB", "4096")) * 1024 * 1024
+MAX_FILES_PER_UPLOAD = int(os.environ.get("SPEEDLAB_MAX_FILES", "50"))
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
 @asynccontextmanager
 async def lifespan(app):
     db.init_db()
@@ -31,6 +41,29 @@ async def lifespan(app):
 
 
 app = FastAPI(title="UPSURGE SpeedLab", docs_url=None, redoc_url=None, lifespan=lifespan)
+
+
+def _authorized(request):
+    """Basic auth (any username) or a bearer token. Constant-time comparison."""
+    header = request.headers.get("authorization", "")
+    if header.startswith("Bearer "):
+        return secrets.compare_digest(header[7:].strip(), AUTH_TOKEN)
+    if header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(header[6:].strip()).decode("utf-8", "replace")
+        except (ValueError, UnicodeDecodeError):
+            return False
+        _, _, password = decoded.partition(":")
+        return secrets.compare_digest(password, AUTH_TOKEN)
+    return False
+
+
+@app.middleware("http")
+async def require_auth(request: Request, call_next):
+    if AUTH_TOKEN and not _authorized(request):
+        return Response(status_code=401, content="authentication required\n",
+                        headers={"WWW-Authenticate": 'Basic realm="UPSURGE SpeedLab"'})
+    return await call_next(request)
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -54,6 +87,9 @@ def capabilities():
         "ffprobe_path": caps["ffprobe_path"],
         "binary_source": caps["binary_source"],
         "scanned": caps["scanned"],
+        "auth_enabled": bool(AUTH_TOKEN),
+        "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
+        "max_files": MAX_FILES_PER_UPLOAD,
         "speeds": ALLOWED_SPEEDS,
         "profiles": ALLOWED_PROFILES,
     }
@@ -67,6 +103,30 @@ def rescan_capabilities():
 
 # ---------------------------------------------------------------------- ingest
 
+def _save_upload(upload_file, dest):
+    """Stream to disk, aborting past the size cap so a big POST can't fill the disk."""
+    written = 0
+    over = False
+    with open(dest, "wb") as out:
+        while True:
+            chunk = upload_file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > MAX_UPLOAD_BYTES:
+                over = True
+                break
+            out.write(chunk)
+    if over:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise ValueError("file exceeds the %d MB upload limit"
+                         % (MAX_UPLOAD_BYTES // (1024 * 1024)))
+    return written
+
+
 def _safe_name(name):
     base = os.path.basename(name or "upload")
     return "".join(c for c in base if c.isalnum() or c in " ._-()[]").strip() or "upload"
@@ -77,6 +137,9 @@ async def upload(files: List[UploadFile] = File(...), match_loudness: str = Form
                  batch_id: str = Form("")):
     if not files:
         raise HTTPException(400, "no files received")
+    if len(files) > MAX_FILES_PER_UPLOAD:
+        raise HTTPException(413, "too many files in one upload (limit %d)"
+                            % MAX_FILES_PER_UPLOAD)
 
     db.ensure_dirs()
     caps = ffmpeg_ops.detect_capabilities()
@@ -97,10 +160,6 @@ async def upload(files: List[UploadFile] = File(...), match_loudness: str = Form
         ext = os.path.splitext(src_name)[1].lower()
         dest = os.path.join(db.INBOX, "%s__%s" % (job_id, src_name))
 
-        with open(dest, "wb") as out:
-            shutil.copyfileobj(upload_file.file, out)
-        await upload_file.close()
-
         row = {
             "id": job_id, "batch_id": batch_id, "src_path": dest, "src_name": src_name,
             "sha256": None, "probe_json": "{}", "kind": None, "speed": DEFAULT_SPEED,
@@ -109,6 +168,16 @@ async def upload(files: List[UploadFile] = File(...), match_loudness: str = Form
             "qa_json": None, "error": None, "created_at": db.now_iso(), "force": 0,
             "fps_mode": "auto",
         }
+
+        try:
+            _save_upload(upload_file, dest)
+        except (ValueError, OSError) as exc:
+            row.update(status="failed", stage=None, error=str(exc))
+            _insert_job(row)
+            created.append(job_id)
+            continue
+        finally:
+            await upload_file.close()
 
         if ext not in ALLOWED_EXT:
             row.update(status="failed", stage=None,
@@ -357,8 +426,15 @@ def output(job_id: str):
 
 
 @app.post("/api/reveal/{job_id}")
-def reveal(job_id: str):
-    """Open the containing folder in the OS file browser."""
+def reveal(job_id: str, request: Request):
+    """Open the containing folder in the OS file browser.
+
+    This runs a command on the machine hosting SpeedLab, so it is refused for any
+    non-loopback caller - a remote user must never be able to drive the host's shell.
+    """
+    client = request.client.host if request.client else None
+    if client not in LOOPBACK:
+        raise HTTPException(403, "reveal is only available to a local session")
     job = db.query_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
     if job is None or not job["out_path"] or not os.path.exists(job["out_path"]):
         raise HTTPException(404, "no output file")

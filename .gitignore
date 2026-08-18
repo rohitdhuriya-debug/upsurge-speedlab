@@ -33,3 +33,7 @@ scratch_ui/
 !work/thumbs/.gitkeep
 !logs/.gitkeep
 !manifests/.gitkeep
+
+# local secrets and container state
+.env
+data/
