@@ -2,6 +2,7 @@
 import base64
 import json
 import os
+import re
 import platform
 import secrets
 import shutil
@@ -47,6 +48,27 @@ PROXY_HEADERS = (
 )
 PUBLIC_MODE = os.environ.get("SPEEDLAB_PUBLIC", "").strip().lower() not in ("", "0", "false", "no")
 
+# Every visitor gets an opaque session id in a cookie. This is NOT a login - it is
+# invisible and needs no credentials - but it scopes each visitor to the batches
+# they created. Without it, ids are the only protection, and an id that leaks
+# anywhere hands a stranger the owner's media.
+SID_COOKIE = "speedlab_sid"
+SID_RE = re.compile(r"^[0-9a-f]{32}$")
+ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# An exposed instance gets stricter defaults automatically: it is serving strangers.
+MAX_TOTAL_DISK_MB = _env_int("SPEEDLAB_MAX_TOTAL_DISK_MB", 20480 if PUBLIC_MODE else 0)
+MAX_INPUT_SECONDS = _env_int("SPEEDLAB_MAX_INPUT_SECONDS", 1800 if PUBLIC_MODE else 0)
+MAX_INPUT_PIXELS = _env_int("SPEEDLAB_MAX_INPUT_PIXELS", 4096 * 4096 if PUBLIC_MODE else 0)
+
 @asynccontextmanager
 async def lifespan(app):
     db.init_db()
@@ -88,11 +110,67 @@ def _authorized(request):
 
 
 @app.middleware("http")
-async def require_auth(request: Request, call_next):
+async def session_and_auth(request: Request, call_next):
     if AUTH_TOKEN and not _authorized(request):
         return Response(status_code=401, content="authentication required\n",
                         headers={"WWW-Authenticate": 'Basic realm="UPSURGE SpeedLab"'})
-    return await call_next(request)
+
+    sid = request.cookies.get(SID_COOKIE) or ""
+    issue = not SID_RE.match(sid)
+    if issue:
+        sid = uuid.uuid4().hex
+    request.state.sid = sid
+
+    response = await call_next(request)
+    if issue:
+        response.set_cookie(SID_COOKIE, sid, max_age=60 * 60 * 24 * 365,
+                            httponly=True, samesite="lax", path="/")
+    return response
+
+
+def _sid(request):
+    return getattr(request.state, "sid", "") or ""
+
+
+def owns_batch(request, batch):
+    """A batch belongs to the session that created it.
+
+    Rows predating session ownership have no owner; those stay reachable, but only
+    from a genuinely local session, never from an exposed one.
+    """
+    if batch is None:
+        return False
+    owner = batch["owner_sid"] if "owner_sid" in batch.keys() else None
+    if not owner:
+        return is_local_session(request)
+    return secrets.compare_digest(str(owner), _sid(request))
+
+
+def batch_or_404(request, batch_id):
+    """404 rather than 403 on a mismatch: do not confirm that an id exists."""
+    if not ID_RE.match(batch_id or ""):
+        raise HTTPException(404, "no such batch")
+    batch = db.query_one("SELECT * FROM batches WHERE id = ?", (batch_id,))
+    if not owns_batch(request, batch):
+        raise HTTPException(404, "no such batch")
+    return batch
+
+
+def job_or_404(request, job_id):
+    """Resolve a job only if the caller owns the batch it belongs to.
+
+    The id format is validated first: these ids reach the filesystem in
+    thumb/log paths, and an unvalidated one is a traversal primitive.
+    """
+    if not ID_RE.match(job_id or ""):
+        raise HTTPException(404, "no such job")
+    job = db.query_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
+    if job is None:
+        raise HTTPException(404, "no such job")
+    batch = db.query_one("SELECT * FROM batches WHERE id = ?", (job["batch_id"],))
+    if not owns_batch(request, batch):
+        raise HTTPException(404, "no such job")
+    return job
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -106,33 +184,68 @@ def index():
 @app.get("/api/capabilities")
 def capabilities(request: Request):
     caps = ffmpeg_ops.detect_capabilities()
+    local = is_local_session(request)
     return {
         "rubberband": caps["rubberband"],
         "ffmpeg_version": caps["ffmpeg_version"],
         "ffmpeg_available": caps["ffmpeg_available"],
         "engine": caps["engine"],
         "forced_atempo": caps["forced_atempo"],
-        "ffmpeg_path": caps["ffmpeg_path"],
-        "ffprobe_path": caps["ffprobe_path"],
+        "ffmpeg_path": caps["ffmpeg_path"] if local else os.path.basename(caps["ffmpeg_path"]),
+        "ffprobe_path": caps["ffprobe_path"] if local else os.path.basename(caps["ffprobe_path"]),
         "binary_source": caps["binary_source"],
-        "scanned": caps["scanned"],
+        "scanned": caps["scanned"] if local else [],
         "auth_enabled": bool(AUTH_TOKEN),
         "public_mode": PUBLIC_MODE,
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         "max_files": MAX_FILES_PER_UPLOAD,
-        "reveal_available": is_local_session(request),
+        "reveal_available": local,
+        "max_input_seconds": MAX_INPUT_SECONDS,
         "speeds": ALLOWED_SPEEDS,
         "profiles": ALLOWED_PROFILES,
     }
 
 
 @app.post("/api/capabilities/rescan")
-def rescan_capabilities():
+def rescan_capabilities(request: Request):
     """Re-detect the ffmpeg binaries - useful right after installing a new build."""
+    if not is_local_session(request):
+        raise HTTPException(403, "rescan is only available to a local session")
     return ffmpeg_ops.detect_capabilities(refresh=True)
 
 
 # ---------------------------------------------------------------------- ingest
+
+def _tree_size(*roots):
+    total = 0
+    for root in roots:
+        for dirpath, _, names in os.walk(root):
+            for name in names:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, name))
+                except OSError:
+                    pass
+    return total
+
+
+def _discard(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _admission_refusal(info):
+    if MAX_INPUT_SECONDS and info.get("duration", 0) > MAX_INPUT_SECONDS:
+        return ("source is %.0fs, over the %ds limit for this instance"
+                % (info.get("duration", 0), MAX_INPUT_SECONDS))
+    pixels = int(info.get("width") or 0) * int(info.get("height") or 0)
+    if MAX_INPUT_PIXELS and pixels > MAX_INPUT_PIXELS:
+        return ("source is %dx%d, over the frame-size limit for this instance"
+                % (info.get("width", 0), info.get("height", 0)))
+    return None
+
 
 def _save_upload(upload_file, dest):
     """Stream to disk, aborting past the size cap so a big POST can't fill the disk."""
@@ -164,8 +277,8 @@ def _safe_name(name):
 
 
 @app.post("/api/upload")
-async def upload(files: List[UploadFile] = File(...), match_loudness: str = Form("0"),
-                 batch_id: str = Form("")):
+async def upload(request: Request, files: List[UploadFile] = File(...),
+                 match_loudness: str = Form("0"), batch_id: str = Form("")):
     if not files:
         raise HTTPException(400, "no files received")
     if len(files) > MAX_FILES_PER_UPLOAD:
@@ -175,14 +288,26 @@ async def upload(files: List[UploadFile] = File(...), match_loudness: str = Form
     db.ensure_dirs()
     caps = ffmpeg_ops.detect_capabilities()
 
-    batch = db.query_one("SELECT * FROM batches WHERE id = ?", (batch_id,)) if batch_id else None
+    batch = None
+    if batch_id and ID_RE.match(batch_id):
+        candidate = db.query_one("SELECT * FROM batches WHERE id = ?", (batch_id,))
+        if owns_batch(request, candidate):
+            batch = candidate
     if batch is None:
         batch_id = uuid.uuid4().hex[:12]
         db.execute(
-            "INSERT INTO batches (id, created_at, status, match_loudness) VALUES (?, ?, ?, ?)",
+            "INSERT INTO batches (id, created_at, status, match_loudness, owner_sid) "
+            "VALUES (?, ?, ?, ?, ?)",
             (batch_id, db.now_iso(), "pending",
-             1 if str(match_loudness) in ("1", "true", "True", "on") else 0),
+             1 if str(match_loudness) in ("1", "true", "True", "on") else 0,
+             _sid(request)),
         )
+
+    if MAX_TOTAL_DISK_MB:
+        used = _tree_size(db.INBOX, db.WORK, db.OUTBOX) // (1024 * 1024)
+        if used >= MAX_TOTAL_DISK_MB:
+            raise HTTPException(507, "storage full (%d MB of %d MB used); remove some files"
+                                % (used, MAX_TOTAL_DISK_MB))
 
     created = []
     for upload_file in files:
@@ -200,28 +325,43 @@ async def upload(files: List[UploadFile] = File(...), match_loudness: str = Form
             "fps_mode": "auto",
         }
 
-        try:
-            _save_upload(upload_file, dest)
-        except (ValueError, OSError) as exc:
-            row.update(status="failed", stage=None, error=str(exc))
-            _insert_job(row)
-            created.append(job_id)
-            continue
-        finally:
-            await upload_file.close()
-
+        # Checked before a single byte is written: a rejected type should never
+        # cost disk, and previously the file was written and then orphaned.
         if ext not in ALLOWED_EXT:
-            row.update(status="failed", stage=None,
+            await upload_file.close()
+            row.update(status="failed", stage=None, src_path=None,
                        error="unsupported file type '%s' (accepts .mp4 .mov .mkv .webm)" % ext)
             _insert_job(row)
             created.append(job_id)
             continue
 
         try:
+            _save_upload(upload_file, dest)
+        except (ValueError, OSError) as exc:
+            row.update(status="failed", stage=None, src_path=None, error=str(exc))
+            _insert_job(row)
+            created.append(job_id)
+            continue
+        finally:
+            await upload_file.close()
+
+        try:
             sha = probe.sha256_file(dest)
             info = probe.probe(dest)
         except Exception as exc:
-            row.update(status="failed", stage=None, error="probe failed: %s" % exc)
+            _discard(dest)
+            row.update(status="failed", stage=None, src_path=None,
+                       error="probe failed: %s" % exc)
+            _insert_job(row)
+            created.append(job_id)
+            continue
+
+        # Admission control: a tiny file can declare an enormous duration or frame
+        # size and turn one request into hours of encoding.
+        refusal = _admission_refusal(info)
+        if refusal:
+            _discard(dest)
+            row.update(status="failed", stage=None, src_path=None, error=refusal)
             _insert_job(row)
             created.append(job_id)
             continue
@@ -257,8 +397,14 @@ def _insert_job(row):
 
 # ------------------------------------------------------------------------ state
 
-def _job_public(row):
+def _job_public(row, local=False):
     out = dict(row)
+    # Absolute paths disclose the install directory and OS username. A local
+    # session gets them (it needs them to reveal the file); nobody else does.
+    if not local:
+        out.pop("src_path", None)
+        if out.get("out_path"):
+            out["out_path"] = os.path.basename(out["out_path"])
     out["probe"] = json.loads(row["probe_json"] or "{}")
     out["qa"] = json.loads(row["qa_json"]) if row["qa_json"] else None
     out.pop("probe_json", None)
@@ -268,25 +414,28 @@ def _job_public(row):
 
 
 @app.get("/api/batches/{batch_id}")
-def get_batch(batch_id: str):
-    batch = db.query_one("SELECT * FROM batches WHERE id = ?", (batch_id,))
-    if batch is None:
-        raise HTTPException(404, "no such batch")
+def get_batch(batch_id: str, request: Request):
+    batch = batch_or_404(request, batch_id)
     jobs = db.query("SELECT * FROM jobs WHERE batch_id = ? ORDER BY created_at, rowid",
                     (batch_id,))
+    local = is_local_session(request)
+    # The worker is process-global, so echoing its job id unscoped told every
+    # caller what someone else was processing - which is all an id-secrecy model
+    # needs to lose. Only report it when it belongs to this batch.
+    running = worker.current_job_id()
+    if running and not any(j["id"] == running for j in jobs):
+        running = None
     return {
         "batch": dict(batch),
-        "jobs": [_job_public(j) for j in jobs],
+        "jobs": [_job_public(j, local) for j in jobs],
         "cancelled": worker.is_cancelled(batch_id),
-        "current_job": worker.current_job_id(),
+        "current_job": running,
     }
 
 
 @app.patch("/api/batches/{batch_id}")
 async def patch_batch(batch_id: str, request: Request):
-    batch = db.query_one("SELECT * FROM batches WHERE id = ?", (batch_id,))
-    if batch is None:
-        raise HTTPException(404, "no such batch")
+    batch_or_404(request, batch_id)
     body = await request.json()
     if "match_loudness" in body:
         db.execute("UPDATE batches SET match_loudness = ? WHERE id = ?",
@@ -296,9 +445,7 @@ async def patch_batch(batch_id: str, request: Request):
 
 @app.patch("/api/jobs/{job_id}")
 async def patch_job(job_id: str, request: Request):
-    job = db.query_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    if job is None:
-        raise HTTPException(404, "no such job")
+    job = job_or_404(request, job_id)
     if job["status"] == "running":
         raise HTTPException(409, "job is running")
 
@@ -324,8 +471,16 @@ async def patch_job(job_id: str, request: Request):
         if mode != "auto":
             fields["target_fps"] = int(mode)
     elif "target_fps" in body:
-        fields["target_fps"] = int(body["target_fps"])
-        fields["fps_mode"] = str(int(body["target_fps"]))
+        # Interpolated straight into -filter_complex, so it takes the same
+        # allowlist as fps_mode. An arbitrary integer here is a CPU/disk bomb.
+        try:
+            fps = int(body["target_fps"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "target_fps must be 30 or 60")
+        if fps not in (30, 60):
+            raise HTTPException(400, "target_fps must be 30 or 60")
+        fields["target_fps"] = fps
+        fields["fps_mode"] = str(fps)
 
     # Recompute the auto fps whenever speed moves and the row is still on auto.
     mode = fields.get("fps_mode", job["fps_mode"] or "auto")
@@ -347,15 +502,14 @@ async def patch_job(job_id: str, request: Request):
 
     if fields:
         db.update_job(job_id, **fields)
-    return {"ok": True, "job": _job_public(db.query_one("SELECT * FROM jobs WHERE id = ?",
-                                                        (job_id,)))}
+    return {"ok": True,
+            "job": _job_public(db.query_one("SELECT * FROM jobs WHERE id = ?", (job_id,)),
+                               is_local_session(request))}
 
 
 @app.post("/api/batches/{batch_id}/start")
-def start_batch(batch_id: str):
-    batch = db.query_one("SELECT * FROM batches WHERE id = ?", (batch_id,))
-    if batch is None:
-        raise HTTPException(404, "no such batch")
+def start_batch(batch_id: str, request: Request):
+    batch = batch_or_404(request, batch_id)
     worker.clear_cancel(batch_id)
     jobs = db.query("SELECT id FROM jobs WHERE batch_id = ? AND status = 'queued' "
                     "ORDER BY created_at, rowid", (batch_id,))
@@ -402,10 +556,8 @@ def _purge_job(job):
 
 
 @app.delete("/api/jobs/{job_id}")
-def delete_job(job_id: str):
-    job = db.query_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    if job is None:
-        raise HTTPException(404, "no such job")
+def delete_job(job_id: str, request: Request):
+    job = job_or_404(request, job_id)
     if job["status"] == "running":
         raise HTTPException(409, "job is running - cancel the batch first")
     kept = job["out_path"] if job["out_path"] and _under(job["out_path"], db.OUTBOX) else None
@@ -414,9 +566,8 @@ def delete_job(job_id: str):
 
 
 @app.delete("/api/batches/{batch_id}")
-def delete_batch(batch_id: str):
-    if db.query_one("SELECT id FROM batches WHERE id = ?", (batch_id,)) is None:
-        raise HTTPException(404, "no such batch")
+def delete_batch(batch_id: str, request: Request):
+    batch_or_404(request, batch_id)
     jobs = db.query("SELECT * FROM jobs WHERE batch_id = ?", (batch_id,))
     running = [j for j in jobs if j["status"] == "running"]
     if running:
@@ -429,9 +580,8 @@ def delete_batch(batch_id: str):
 
 
 @app.post("/api/batches/{batch_id}/cancel")
-def cancel_batch(batch_id: str):
-    if db.query_one("SELECT id FROM batches WHERE id = ?", (batch_id,)) is None:
-        raise HTTPException(404, "no such batch")
+def cancel_batch(batch_id: str, request: Request):
+    batch_or_404(request, batch_id)
     worker.cancel_batch(batch_id)
     return {"ok": True, "note": "stops after the current job finishes; "
                                 "remaining jobs stay queued"}
@@ -440,7 +590,8 @@ def cancel_batch(batch_id: str):
 # ------------------------------------------------------------------------ assets
 
 @app.get("/api/thumb/{job_id}")
-def thumb(job_id: str):
+def thumb(job_id: str, request: Request):
+    job_or_404(request, job_id)
     path = os.path.join(db.THUMBS, "%s.jpg" % job_id)
     if not os.path.exists(path):
         raise HTTPException(404, "no thumbnail")
@@ -448,9 +599,9 @@ def thumb(job_id: str):
 
 
 @app.get("/api/output/{job_id}")
-def output(job_id: str):
-    job = db.query_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    if job is None or not job["out_path"] or not os.path.exists(job["out_path"]):
+def output(job_id: str, request: Request):
+    job = job_or_404(request, job_id)
+    if not job["out_path"] or not os.path.exists(job["out_path"]):
         raise HTTPException(404, "no output file")
     return FileResponse(job["out_path"], media_type="video/mp4",
                         filename=os.path.basename(job["out_path"]))
@@ -465,8 +616,8 @@ def reveal(job_id: str, request: Request):
     """
     if not is_local_session(request):
         raise HTTPException(403, "reveal is only available to a local session")
-    job = db.query_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    if job is None or not job["out_path"] or not os.path.exists(job["out_path"]):
+    job = job_or_404(request, job_id)
+    if not job["out_path"] or not os.path.exists(job["out_path"]):
         raise HTTPException(404, "no output file")
     path = job["out_path"]
     system = platform.system()
@@ -483,7 +634,10 @@ def reveal(job_id: str, request: Request):
 
 
 @app.get("/api/log/{job_id}")
-def get_log(job_id: str):
+def get_log(job_id: str, request: Request):
+    # The log carries the absolute source path and original filename, so it is
+    # owner-only like the media itself.
+    job_or_404(request, job_id)
     path = os.path.join(db.LOGS, "%s.log" % job_id)
     if not os.path.exists(path):
         raise HTTPException(404, "no log yet")

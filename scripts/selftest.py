@@ -2,6 +2,7 @@
 
 Run:  .venv/bin/python scripts/selftest.py     (or  .venv\\Scripts\\python scripts\\selftest.py)
 """
+import http.cookiejar
 import json
 import math
 import os
@@ -22,6 +23,11 @@ BASE = "http://127.0.0.1:%d" % PORT
 FFMPEG = os.environ.get("SPEEDLAB_FFMPEG", "ffmpeg")
 
 SINE_HZ = 220.0
+# Batches are owned by a session cookie, so the test drives the API the way a
+# browser does - one jar for the whole run.
+_JAR = http.cookiejar.CookieJar()
+_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_JAR))
+
 results = []
 
 
@@ -33,7 +39,7 @@ def record(name, passed, detail):
 # ------------------------------------------------------------------ http helpers
 
 def get(path):
-    with urllib.request.urlopen(BASE + path, timeout=30) as r:
+    with _OPENER.open(BASE + path, timeout=30) as r:
         return json.loads(r.read().decode())
 
 
@@ -41,7 +47,7 @@ def post_json(path, payload=None, method="POST"):
     data = json.dumps(payload).encode() if payload is not None else b""
     req = urllib.request.Request(BASE + path, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with _OPENER.open(req, timeout=60) as r:
         return json.loads(r.read().decode())
 
 
@@ -63,7 +69,7 @@ def upload(paths, batch_id=None, match_loudness=False):
     req = urllib.request.Request(BASE + "/api/upload", data=body, method="POST",
                                  headers={"Content-Type":
                                           "multipart/form-data; boundary=%s" % boundary})
-    with urllib.request.urlopen(req, timeout=300) as r:
+    with _OPENER.open(req, timeout=300) as r:
         return json.loads(r.read().decode())
 
 

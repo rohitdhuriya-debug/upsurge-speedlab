@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS batches (
   id TEXT PRIMARY KEY,
   created_at TEXT,
   status TEXT,
-  match_loudness INTEGER DEFAULT 0
+  match_loudness INTEGER DEFAULT 0,
+  owner_sid TEXT
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -83,6 +84,10 @@ def init_db():
         conn = connect()
         try:
             conn.executescript(SCHEMA)
+            # Migration for databases created before batches were owned by a session.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(batches)")}
+            if "owner_sid" not in cols:
+                conn.execute("ALTER TABLE batches ADD COLUMN owner_sid TEXT")
             conn.commit()
         finally:
             conn.close()

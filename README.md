@@ -220,6 +220,11 @@ measured pitch check. Leaves your real `inbox/`, `work/` and `outbox/` untouched
 | `SPEEDLAB_ROOT` | Use a different project root for db/inbox/work/outbox/logs |
 | `SPEEDLAB_FORCE_ATEMPO=1` | Pretend rubberband is absent (exercises the fallback) |
 | `SPEEDLAB_FFMPEG` / `SPEEDLAB_FFPROBE` | Point at specific binaries |
+| `SPEEDLAB_AUTH_TOKEN` | Require this token on every request. Unset = open |
+| `SPEEDLAB_PUBLIC` | `1` when reachable from outside this machine. Disables the host-command endpoint and applies stricter input defaults |
+| `SPEEDLAB_MAX_UPLOAD_MB` / `SPEEDLAB_MAX_FILES` | Per-file size cap, files per request |
+| `SPEEDLAB_MAX_TOTAL_DISK_MB` | Stop accepting uploads past this total |
+| `SPEEDLAB_MAX_INPUT_SECONDS` / `SPEEDLAB_MAX_INPUT_PIXELS` | Refuse sources longer or larger than this |
 
 ## API
 
@@ -280,9 +285,33 @@ it runs on.** It disables the endpoint outright and is the only layer that also 
 TCP forwarder, which adds no headers to give itself away. The UI hides the reveal action when
 `reveal_available` comes back false.
 
-**3. Upload limits.** `SPEEDLAB_MAX_UPLOAD_MB` (default 4096) is enforced while streaming to
+**3. Per-visitor ownership.** Every visitor is issued an opaque session cookie on first
+request. It is **not a login** — no username, no password, nothing to type — but batches and
+jobs are scoped to the session that created them. Every read and write
+(`/api/batches`, `/api/jobs`, `/api/output`, `/api/log`, `/api/thumb`) authorises against it
+and returns `404` — not `403` — on a mismatch, so an id is never confirmed to exist.
+
+This exists because id secrecy alone was not enough: `GET /api/batches/{id}` used to echo the
+process-global `current_job`, so anyone could upload a junk file, poll their *own* batch, and
+be handed the id of whatever someone else was processing — then pull that job's thumbnail,
+log and finished video, pivot to the whole batch, and delete the source. Ids are 48 bits and
+unguessable, but they only had to leak once.
+
+**4. Input admission control.** A few-KB file can declare an enormous duration or frame size
+and turn one request into hours of encoding, so sources are refused above
+`SPEEDLAB_MAX_INPUT_SECONDS` and `SPEEDLAB_MAX_INPUT_PIXELS`, and uploads stop once
+`SPEEDLAB_MAX_TOTAL_DISK_MB` is reached. **With `SPEEDLAB_PUBLIC=1` these default to 30
+minutes, 4096x4096 and 20 GB**; locally they are unlimited unless you set them.
+
+**5. Upload limits.** `SPEEDLAB_MAX_UPLOAD_MB` (default 4096) is enforced while streaming to
 disk, so an oversized POST is aborted mid-write and the partial file removed rather than
-filling the disk. `SPEEDLAB_MAX_FILES` (default 50) caps files per request.
+filling the disk. `SPEEDLAB_MAX_FILES` (default 50) caps files per request. The file type is
+checked *before* any bytes are written, and a file rejected on type, size or probe failure is
+removed rather than orphaned in `inbox/`.
+
+Job and batch ids are validated as 12 hex characters before they ever reach a filesystem
+path, since `/api/log/{id}` and `/api/thumb/{id}` build paths from them — unvalidated, that is
+a traversal primitive, and a UNC path on Windows.
 
 ### Exposing it
 
