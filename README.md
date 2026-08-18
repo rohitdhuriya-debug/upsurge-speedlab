@@ -7,6 +7,22 @@ Drop 10–12 files in, set one speed for all of them, override individual rows, 
 
 ---
 
+## Getting it on another machine
+
+```
+git clone https://github.com/rohitdhuriya-debug/upsurge-speedlab.git
+cd upsurge-speedlab
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+run.bat
+```
+
+(macOS/Linux: `.venv/bin/pip install -r requirements.txt` then `./run.command`.)
+
+The repo carries code only. `inbox/`, `work/`, `outbox/`, `logs/`, `manifests/` and the
+SQLite database are deliberately gitignored — your media and processing history stay on your
+machine and never reach GitHub.
+
 ## Running it
 
 ```
@@ -221,6 +237,23 @@ GET   /api/output/{job_id}     the finished file
 POST  /api/reveal/{job_id}     open the containing folder
 GET   /api/log/{job_id}        the job's ffmpeg log
 ```
+
+## Remote access — read before exposing this
+
+SpeedLab is built as a **local, single-user tool** and binds `127.0.0.1` on purpose. It has
+no authentication of any kind. Do not put it behind a public URL as-is:
+
+- anyone with the link could upload files, burn your CPU and fill your disk
+- `GET /api/output/{id}` and `/api/log/{id}` would hand out your finished videos and logs
+- `POST /api/reveal/{id}` runs `open` / `explorer` **on the host machine**
+
+Before it could safely take a public address it needs, at minimum: an auth layer, upload size
+and rate limits, `/api/reveal` disabled for non-local requests, and a host with an
+ffmpeg build that has rubberband. A box able to chew through 4K vertical video is also not a
+free tier.
+
+For using it on a second machine, clone the repo and run it locally there — same tool, no
+exposure.
 
 ## Troubleshooting
 
