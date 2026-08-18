@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UPSURGE SpeedLab</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>UPSURGE <span class="accent">SpeedLab</span></h1>
+  <div class="sub" id="capline">checking ffmpeg&hellip;</div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+
+  <div id="dropzone" class="dropzone">
+    <div class="dz-main">Drop video files here</div>
+    <div class="dz-sub">or click to browse &middot; .mp4 .mov .mkv .webm &middot; multi-select</div>
+    <input type="file" id="filepicker" multiple accept=".mp4,.mov,.mkv,.webm,video/*" hidden>
+  </div>
+
+  <div id="master" class="master hidden">
+    <label>Set all speed to
+      <select id="master-speed"></select>
+    </label>
+    <label>Set all audio profile to
+      <select id="master-profile">
+        <option value="voice_music">Voice + music</option>
+        <option value="voice_only">Voice only</option>
+      </select>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="master-loudness">
+      Match source loudness
+    </label>
+    <div class="spacer"></div>
+    <button id="btn-process" class="primary">Process All</button>
+    <button id="btn-cancel" class="ghost hidden">Cancel</button>
+    <button id="btn-clear" class="ghost">Remove All</button>
+  </div>
+
+  <table id="jobtable" class="hidden">
+    <thead>
+      <tr>
+        <th class="c-thumb"></th>
+        <th class="c-name">filename</th>
+        <th class="c-num">duration</th>
+        <th class="c-type">type</th>
+        <th class="c-sel">speed</th>
+        <th class="c-sel">audio profile</th>
+        <th class="c-fps">fps</th>
+        <th class="c-status">status</th>
+        <th class="c-out">output</th>
+        <th class="c-del"></th>
+      </tr>
+    </thead>
+    <tbody id="jobrows"></tbody>
+  </table>
+
+  <div id="empty" class="empty">No files loaded.</div>
+
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
