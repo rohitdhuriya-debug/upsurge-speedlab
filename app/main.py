@@ -32,6 +32,21 @@ MAX_UPLOAD_BYTES = int(os.environ.get("SPEEDLAB_MAX_UPLOAD_MB", "4096")) * 1024 
 MAX_FILES_PER_UPLOAD = int(os.environ.get("SPEEDLAB_MAX_FILES", "50"))
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
+# A reverse proxy or tunnel (cloudflared, ngrok, nginx) opens its own connection to
+# the app, so the socket's peer address is the PROXY, not the visitor. On a natively
+# run instance that peer IS 127.0.0.1, which would make a plain loopback check say
+# "local" for requests arriving from the public internet. Verified: a proxy
+# connecting from 127.0.0.1 sails straight past a naive client.host check.
+# So a request is only treated as local when the socket is loopback AND it carries
+# no sign of having been forwarded - and SPEEDLAB_PUBLIC turns it off outright.
+PROXY_HEADERS = (
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
+    "forwarded", "cf-connecting-ip", "cf-ray", "cf-ipcountry", "cf-visitor",
+    "x-original-forwarded-for", "true-client-ip", "fly-client-ip",
+    "ngrok-trace-id", "x-nginx-proxy",
+)
+PUBLIC_MODE = os.environ.get("SPEEDLAB_PUBLIC", "").strip().lower() not in ("", "0", "false", "no")
+
 @asynccontextmanager
 async def lifespan(app):
     db.init_db()
@@ -41,6 +56,20 @@ async def lifespan(app):
 
 
 app = FastAPI(title="UPSURGE SpeedLab", docs_url=None, redoc_url=None, lifespan=lifespan)
+
+
+def is_local_session(request):
+    """True only for a request that genuinely originated on this machine.
+
+    Deliberately conservative: anything that looks proxied is treated as remote.
+    """
+    if PUBLIC_MODE:
+        return False
+    for header in PROXY_HEADERS:
+        if header in request.headers:
+            return False
+    client = request.client.host if request.client else None
+    return client in LOOPBACK
 
 
 def _authorized(request):
@@ -75,7 +104,7 @@ def index():
 
 
 @app.get("/api/capabilities")
-def capabilities():
+def capabilities(request: Request):
     caps = ffmpeg_ops.detect_capabilities()
     return {
         "rubberband": caps["rubberband"],
@@ -88,8 +117,10 @@ def capabilities():
         "binary_source": caps["binary_source"],
         "scanned": caps["scanned"],
         "auth_enabled": bool(AUTH_TOKEN),
+        "public_mode": PUBLIC_MODE,
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         "max_files": MAX_FILES_PER_UPLOAD,
+        "reveal_available": is_local_session(request),
         "speeds": ALLOWED_SPEEDS,
         "profiles": ALLOWED_PROFILES,
     }
@@ -432,8 +463,7 @@ def reveal(job_id: str, request: Request):
     This runs a command on the machine hosting SpeedLab, so it is refused for any
     non-loopback caller - a remote user must never be able to drive the host's shell.
     """
-    client = request.client.host if request.client else None
-    if client not in LOOPBACK:
+    if not is_local_session(request):
         raise HTTPException(403, "reveal is only available to a local session")
     job = db.query_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
     if job is None or not job["out_path"] or not os.path.exists(job["out_path"]):

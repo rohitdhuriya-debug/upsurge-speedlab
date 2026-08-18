@@ -12,6 +12,9 @@ services:
     environment:
       # REQUIRED whenever this is reachable from anywhere but this machine.
       SPEEDLAB_AUTH_TOKEN: "${SPEEDLAB_AUTH_TOKEN:-}"
+      # 1 = this instance is reachable from outside the machine. Disables the
+      # reveal endpoint outright, since that runs a command on the host.
+      SPEEDLAB_PUBLIC: "${SPEEDLAB_PUBLIC:-0}"
       SPEEDLAB_MAX_UPLOAD_MB: "${SPEEDLAB_MAX_UPLOAD_MB:-4096}"
       SPEEDLAB_MAX_FILES: "${SPEEDLAB_MAX_FILES:-50}"
     restart: unless-stopped

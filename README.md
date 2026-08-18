@@ -263,8 +263,22 @@ assets alike — needs it. HTTP Basic (any username, the token as password) or
 frictionless local use.
 
 **2. Host commands refuse remote callers.** `POST /api/reveal/{id}` runs `open` / `explorer`
-on the machine hosting SpeedLab. It is rejected with `403` for any non-loopback client, so a
-remote user can never drive the host's shell.
+on the machine hosting SpeedLab, so it must never be reachable from outside.
+
+A plain "is the client 127.0.0.1?" check is **not enough**, and this was verified rather than
+assumed. A tunnel or reverse proxy opens its own connection to the app, so on a natively-run
+instance the socket's peer address *is* `127.0.0.1` even for a visitor from the public
+internet — the guard passes and the endpoint is exposed. Three layers now apply:
+
+- the socket must be loopback, **and**
+- the request must carry no forwarding headers (`X-Forwarded-For`, `CF-Connecting-IP`,
+  `CF-Ray`, `Forwarded`, `X-Real-IP`, ngrok and nginx markers), **and**
+- `SPEEDLAB_PUBLIC` must not be set.
+
+**Set `SPEEDLAB_PUBLIC=1` whenever this instance is reachable from anywhere but the machine
+it runs on.** It disables the endpoint outright and is the only layer that also stops a bare
+TCP forwarder, which adds no headers to give itself away. The UI hides the reveal action when
+`reveal_available` comes back false.
 
 **3. Upload limits.** `SPEEDLAB_MAX_UPLOAD_MB` (default 4096) is enforced while streaming to
 disk, so an oversized POST is aborted mid-write and the partial file removed rather than
@@ -278,6 +292,11 @@ Put the token in `.env` (gitignored), bring the container up, then tunnel:
 docker compose up -d
 cloudflared tunnel --url http://127.0.0.1:5070
 ```
+
+Set `SPEEDLAB_PUBLIC=1` in `.env` before doing this. Leaving `SPEEDLAB_AUTH_TOKEN` empty
+makes the instance **completely open** — anyone with the URL can upload, process, and
+download everything in the outbox. That is a deliberate choice, not an oversight; set the
+token if you want it gated.
 
 That prints a `https://<random>.trycloudflare.com` URL. Two caveats: the tunnel is
 **ephemeral** — it dies with the process and the URL changes each time — and it only works

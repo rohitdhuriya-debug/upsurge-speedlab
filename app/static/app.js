@@ -9,6 +9,7 @@ let batchId = null;
 let jobs = [];
 let pollTimer = null;
 let uploading = false;
+let revealAvailable = true;
 const rowCache = new Map();   // job_id -> {tr, cells}
 const openQA = new Set();
 
@@ -46,6 +47,7 @@ async function loadCapabilities() {
     $("capline").textContent =
       "ffmpeg " + caps.ffmpeg_version + " · audio engine: " + caps.engine +
       " · port " + location.port;
+    revealAvailable = caps.reveal_available !== false;
     $("capline").title = "ffmpeg: " + caps.ffmpeg_path +
       "\nffprobe: " + caps.ffprobe_path +
       "\nselected by: " + caps.binary_source;
@@ -502,16 +504,25 @@ function renderOutput(td, j) {
   }
   const name = j.out_path.split(/[\\/]/).pop();
 
-  const open = document.createElement("a");
-  open.className = "link outname";
-  open.href = "#";
-  open.textContent = name;
-  open.title = j.out_path + "\n(click to reveal in file manager)";
-  open.onclick = (e) => {
-    e.preventDefault();
-    fetch("/api/reveal/" + j.id, { method: "POST" });
-  };
-  td.appendChild(open);
+  if (revealAvailable) {
+    const open = document.createElement("a");
+    open.className = "link outname";
+    open.href = "#";
+    open.textContent = name;
+    open.title = j.out_path + "\n(click to reveal in file manager)";
+    open.onclick = (e) => {
+      e.preventDefault();
+      fetch("/api/reveal/" + j.id, { method: "POST" });
+    };
+    td.appendChild(open);
+  } else {
+    // Remote session: revealing a folder happens on the host, not here.
+    const label = document.createElement("span");
+    label.className = "mono outname";
+    label.textContent = name;
+    label.title = j.out_path;
+    td.appendChild(label);
+  }
 
   const play = document.createElement("a");
   play.className = "link dim";
