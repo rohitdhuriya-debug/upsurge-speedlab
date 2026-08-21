@@ -4,9 +4,10 @@ services:
     image: upsurge-speedlab
     container_name: speedlab
     ports:
-      # Host port 5070 -> container 5070. Bound to localhost; public access is
-      # meant to arrive through the tunnel, not by opening this to the LAN.
-      - "127.0.0.1:5070:5070"
+      # Host port (default 5090) -> container 5070. Bound to localhost; public
+      # access is meant to arrive through the tunnel, not by opening this to the
+      # LAN. Override with SPEEDLAB_HOST_PORT when the port is already taken.
+      - "127.0.0.1:${SPEEDLAB_HOST_PORT:-5090}:5070"
     volumes:
       - ./data:/data
     environment:

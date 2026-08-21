@@ -37,3 +37,4 @@ scratch_ui/
 # local secrets and container state
 .env
 data/
+.public_url
