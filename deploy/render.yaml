@@ -1,0 +1,21 @@
+# Render blueprint. Copy to the repo root as render.yaml, then New > Blueprint.
+services:
+  - type: web
+    name: upsurge-speedlab
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Free and Starter will NOT work: no persistent disk, and free spins down
+    # after 15 minutes idle, killing any encode in flight.
+    plan: standard
+    healthCheckPath: /api/capabilities
+    envVars:
+      - key: SPEEDLAB_ROOT
+        value: /data
+      - key: SPEEDLAB_PUBLIC
+        value: "1"
+      - key: SPEEDLAB_MAX_UPLOAD_MB
+        value: "2048"
+    disk:
+      name: speedlab-data
+      mountPath: /data
+      sizeGB: 20

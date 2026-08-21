@@ -23,4 +23,5 @@ RUN mkdir -p /data
 VOLUME ["/data"]
 
 EXPOSE 5070
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5070"]
+# Hosts inject their own $PORT; fall back to 5070 for local/compose use.
+CMD ["sh", "-c", "exec python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-5070}"]

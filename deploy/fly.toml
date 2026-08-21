@@ -1,0 +1,34 @@
+# Fly.io. Copy to the repo root as fly.toml, then: fly launch --no-deploy && fly deploy
+app = "upsurge-speedlab"
+primary_region = "bom"          # Mumbai. `fly platform regions` for others.
+kill_signal = "SIGTERM"          # Fly defaults to SIGINT, which CPython delivers only to
+kill_timeout = "300s"            # the MAIN thread - the ffmpeg worker would never hear it.
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  SPEEDLAB_ROOT = "/data"
+  SPEEDLAB_PUBLIC = "1"
+  SPEEDLAB_MAX_UPLOAD_MB = "2048"
+
+[http_service]
+  internal_port = 5070
+  force_https = true
+  auto_start_machines = true
+  # MUST stay false. Fly's proxy cannot see the background worker, so with
+  # auto-stop on it stops the machine minutes after the upload response and the
+  # encode dies half-finished. A keepalive ping does NOT work around this.
+  auto_stop_machines = false
+  min_machines_running = 1
+
+[[mounts]]
+  source = "speedlab_data"
+  destination = "/data"
+
+[[vm]]
+  # Shared vCPUs are 6.25% of a core after a ~500s burst balance, which collapses
+  # x264 to 1/16 speed mid-encode. Performance vCPUs are required, not optional.
+  cpu_kind = "performance"
+  cpus = 2
+  memory = "4gb"
